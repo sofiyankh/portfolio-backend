@@ -15,6 +15,25 @@ app.use(express.json());
 const ENDPOINT = "https://models.github.ai/inference";
 const MODEL = "openai/gpt-4o-mini";
 
+// =======================
+// 🔒 LANGUAGE ENFORCEMENT ADDITION
+// =======================
+const LANGUAGE_POLICY = `
+LANGUAGE POLICY (STRICT):
+
+- All responses must be written entirely in English.
+- Never mix French and English in the same response.
+- French academic titles may appear as official names only.
+- All explanations must remain strictly in English.
+`;
+
+// Simple validation guard
+function containsFrench(text) {
+  return /[àâçéèêëîïôûùüÿœ]/i.test(text);
+}
+// =======================
+
+
 // Read tokens from environment (do NOT hardcode tokens in source)
 const TOKENS = [
   process.env.GITHUB_TOKEN1 || null,
@@ -172,11 +191,9 @@ function makeClient(token) {
 // Utility: decide which token index to try first
 function getPreferredTokenIndex() {
   const now = Date.now();
-  // choose first token that is not in cooldown, prefer index 0
   for (let i = 0; i < tokenState.length; i++) {
     if (now - tokenState[i].failedAt > COOLDOWN_MS) return i;
   }
-  // if all are in cooldown, return the one with earliest failedAt (best-effort)
   let earliest = 0;
   for (let i = 1; i < tokenState.length; i++) {
     if (tokenState[i].failedAt < tokenState[earliest].failedAt) earliest = i;
@@ -196,42 +213,35 @@ async function requestWithTokenIndex(tokenIndex, messagesPayload) {
       body: {
         model: MODEL,
         messages: messagesPayload,
-        temperature: 0.6,
+        temperature: 0.2, // 🔽 reduced from 0.6 for deterministic language
         max_tokens: 600
       }
     });
 
     if (isUnexpected(response)) {
-      // treat as failure
       const err = response.body?.error || { message: "Unexpected response" };
       throw err;
     }
 
-    // extract reply defensively
     const reply = response.body?.choices?.[0]?.message?.content;
     if (!reply || typeof reply !== "string") {
       throw { message: "Empty or unexpected reply shape" };
     }
 
-    // mark token healthy
     tokenState[tokenIndex].failedAt = 0;
     return reply;
   } catch (err) {
-    // mark token failed and set cooldown timestamp (do NOT log the token value)
     tokenState[tokenIndex].failedAt = Date.now();
-    // Normalize error object
     const normalized = {
       message: err?.message || String(err),
       code: err?.code || err?.status || "unknown_error"
     };
-    // throw normalized error up to caller
     throw normalized;
   }
 }
 
 /**
  * Main endpoint: tries primary token first, falls back to secondary automatically.
- * Request body: { message: string, history?: [{ sender: 'user'|'bot', text: string }] }
  */
 app.post("/api/ai", async (req, res) => {
   const { message, history = [] } = req.body;
@@ -239,7 +249,6 @@ app.post("/api/ai", async (req, res) => {
     return res.status(400).json({ text: "No message provided." });
   }
 
-  // Build messages payload: system + history + user
   const formattedHistory = (Array.isArray(history) ? history : []).map((m) => ({
     role: m.sender === "user" ? "user" : "assistant",
     content: m.text
@@ -247,30 +256,32 @@ app.post("/api/ai", async (req, res) => {
 
   const messagesPayload = [
     { role: "system", content: SOFYAN_PROFILE },
+    { role: "system", content: LANGUAGE_POLICY }, // 🔒 added
     ...formattedHistory,
     { role: "user", content: message }
   ];
 
-  // decide order to try tokens
   const firstIndex = getPreferredTokenIndex();
   const order = [firstIndex];
   for (let i = 0; i < TOKENS.length; i++) if (i !== firstIndex) order.push(i);
 
-  // Try tokens in order; silently attempt fallback on error
   let lastError = null;
+
   for (const idx of order) {
     try {
-      const reply = await requestWithTokenIndex(idx, messagesPayload);
-      // success -> send to UI
+      let reply = await requestWithTokenIndex(idx, messagesPayload);
+
+      // 🔒 language validation guard
+      if (containsFrench(reply)) {
+        reply = await requestWithTokenIndex(idx, messagesPayload);
+      }
+
       return res.json({ text: reply });
     } catch (err) {
-      // keep last error for eventual reporting (do not return raw token or stack)
       lastError = err;
-      // continue to next token silently
     }
   }
 
-  // If we reach here, all tokens failed
   console.error("AI ERROR: all tokens failed — last error:", lastError);
   res.status(502).json({ text: "AI service unavailable (all tokens failed)." });
 });
