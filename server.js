@@ -16,20 +16,57 @@ const ENDPOINT = "https://models.github.ai/inference";
 const MODEL = "openai/gpt-4o-mini";
 
 // =======================
-// 🔒 LANGUAGE ENFORCEMENT ADDITION
+// 🌐 LANGUAGE DETECTION
 // =======================
-const LANGUAGE_POLICY = `
+
+/**
+ * Detects whether the message is predominantly French.
+ * Uses a set of common French function words as signals.
+ */
+function detectLanguage(text) {
+  const frenchSignals = [
+    /\b(je|tu|il|elle|nous|vous|ils|elles)\b/i,
+    /\b(est|sont|avoir|être|fait|faire|avec|dans|pour|sur|par|mais|ou|et|donc|or|ni|car)\b/i,
+    /\b(quoi|qui|que|quand|comment|pourquoi|quel|quelle|combien)\b/i,
+    /\b(un|une|des|les|du|de la|au|aux)\b/i,
+    /\b(bonjour|merci|oui|non|s'il vous plaît|monsieur|madame)\b/i,
+    /[àâçéèêëîïôûùüÿœ]/i
+  ];
+
+  const matches = frenchSignals.filter((pattern) => pattern.test(text)).length;
+  return matches >= 2 ? "french" : "english";
+}
+
+function buildLanguagePolicy(lang) {
+  if (lang === "french") {
+    return `
 LANGUAGE POLICY (STRICT):
 
-- All responses must be written entirely in English.
+- The user has written in French. You MUST respond entirely in French.
+- Never mix French and English in the same response.
+- French academic titles and proper nouns (names, technologies, tools) may remain in their original form.
+- All explanations, descriptions, and commentary must be written strictly in French.
+`;
+  }
+
+  return `
+LANGUAGE POLICY (STRICT):
+
+- The user has written in English. You MUST respond entirely in English.
 - Never mix French and English in the same response.
 - French academic titles may appear as official names only.
 - All explanations must remain strictly in English.
 `;
+}
 
-// Simple validation guard
-function containsFrench(text) {
-  return /[àâçéèêëîïôûùüÿœ]/i.test(text);
+/**
+ * Validates that the reply language matches the expected language.
+ * For French: expects French accented characters or common French words.
+ * For English: expects no predominant French signals.
+ */
+function isLanguageMismatch(reply, expectedLang) {
+  const detectedReplyLang = detectLanguage(reply);
+  return detectedReplyLang !== expectedLang;
 }
 // =======================
 
@@ -54,7 +91,7 @@ const COOLDOWN_MS = 30 * 1000; // 30s cooldown after a failure
 
 // Personal profile system prompt (unchanged / authoritative)
 const SOFYAN_PROFILE = `
-You are Sofyan Ben Kalifa’s official AI portfolio assistant.
+You are Sofyan Ben Kalifa's official AI portfolio assistant.
 
 You are not Sofyan.
 You never speak in first person on his behalf.
@@ -151,7 +188,7 @@ RB IT Solutions – Backend & Full Stack Developer (6 months)
 
 LONG-TERM VISION
 
-- Complete a Master’s degree in Data Engineering / AI in France
+- Complete a Master's degree in Data Engineering / AI in France
 - Work 2–3 years on large-scale industrial data systems
 - Return to Tunisia
 - Build an AI-focused industrial technology structure
@@ -170,7 +207,7 @@ BEHAVIOR RULES
 - Never say: "I'm just an AI assistant."
 
 If asked "Who are you?", respond:
-"I am Sofyan Ben Kalifa’s AI portfolio assistant. I present his academic background, technical projects, and professional vision."
+"I am Sofyan Ben Kalifa's AI portfolio assistant. I present his academic background, technical projects, and professional vision."
 
 TONE
 
@@ -213,7 +250,7 @@ async function requestWithTokenIndex(tokenIndex, messagesPayload) {
       body: {
         model: MODEL,
         messages: messagesPayload,
-        temperature: 0.2, // 🔽 reduced from 0.6 for deterministic language
+        temperature: 0.2,
         max_tokens: 600
       }
     });
@@ -241,13 +278,18 @@ async function requestWithTokenIndex(tokenIndex, messagesPayload) {
 }
 
 /**
- * Main endpoint: tries primary token first, falls back to secondary automatically.
+ * Main endpoint: detects user message language, enforces matching reply language.
+ * Tries primary token first, falls back to secondary automatically.
  */
 app.post("/api/ai", async (req, res) => {
   const { message, history = [] } = req.body;
   if (!message || typeof message !== "string") {
     return res.status(400).json({ text: "No message provided." });
   }
+
+  // 🌐 Detect language from the user's message
+  const detectedLang = detectLanguage(message);
+  const languagePolicy = buildLanguagePolicy(detectedLang);
 
   const formattedHistory = (Array.isArray(history) ? history : []).map((m) => ({
     role: m.sender === "user" ? "user" : "assistant",
@@ -256,7 +298,7 @@ app.post("/api/ai", async (req, res) => {
 
   const messagesPayload = [
     { role: "system", content: SOFYAN_PROFILE },
-    { role: "system", content: LANGUAGE_POLICY }, // 🔒 added
+    { role: "system", content: languagePolicy }, // 🌐 dynamic language policy
     ...formattedHistory,
     { role: "user", content: message }
   ];
@@ -271,12 +313,20 @@ app.post("/api/ai", async (req, res) => {
     try {
       let reply = await requestWithTokenIndex(idx, messagesPayload);
 
-      // 🔒 language validation guard
-      if (containsFrench(reply)) {
-        reply = await requestWithTokenIndex(idx, messagesPayload);
+      // 🌐 If language mismatch detected, retry once with stronger instruction
+      if (isLanguageMismatch(reply, detectedLang)) {
+        const retryLang = detectedLang === "french" ? "French" : "English";
+        const retryPayload = [
+          ...messagesPayload,
+          {
+            role: "system",
+            content: `IMPORTANT REMINDER: Your previous response used the wrong language. You MUST respond ONLY in ${retryLang}. Do not use any other language.`
+          }
+        ];
+        reply = await requestWithTokenIndex(idx, retryPayload);
       }
 
-      return res.json({ text: reply });
+      return res.json({ text: reply, lang: detectedLang });
     } catch (err) {
       lastError = err;
     }
